@@ -1,0 +1,10 @@
+import sys
+import os
+
+# Add the path to Aria/Python to the python path, if it's not already in there...
+
+directories = ['/usr/local/Aria/python', 'C:\\Program Files\\mobilerobots\\aria\\python']
+path = sys.path
+for directory in directories:
+    exists = os.path.exists(directory)
+    if exists and not directory in path: sys.path.insert(0,directory)

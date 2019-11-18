@@ -1,0 +1,351 @@
+import ConfigParser
+import logging
+import os
+import socket
+import sys
+import threading
+import time
+from subprocess import Popen
+
+import serial
+from scipy.interpolate import interp1d
+
+import Sonar
+from library import Maestro
+
+
+def set_sys_arg():
+    new = []
+    for x in sys.argv: new.append(str(x))
+    sys.argv = new
+    sys.argv += ['--robotPort', '/dev/ttyS0']
+
+
+def default_function(*args):
+    return args
+
+
+def lst2str(lst):
+    if isinstance(lst, basestring): return lst
+    text = ''
+    for x in lst: text += str(x) + ' '
+    text = text.rstrip(' ')
+    return text
+
+
+# For servos, target represents the pulse width in of quarter-microseconds
+# Servo center is at 1500 microseconds, or 6000 quarter-microseconds
+# Typcially valid servo range is 3000 to 9000 quarter-microseconds
+
+def scale_motor_position(position, axis, settings=None):
+    if settings is None:
+        settings = ConfigParser.ConfigParser()
+        settings.read('Desktop/amigobot/config/configuration.cfg')
+
+    elevation_minus_90 = settings.getint('sonar', 'elevation_minus_90') * 0.25
+    elevation_zero = settings.getint('sonar', 'elevation_zero') * 0.25
+
+    azimuth_minus_90 = settings.getint('sonar', 'azimuth_minus_90') * 0.25
+    azimuth_zero = settings.getint('sonar', 'azimuth_zero') * 0.25
+    azimuth_plus_90 = settings.getint('sonar', 'azimuth_plus_90') * 0.25
+
+    position = float(position)
+
+    if axis == 'az':
+        degrees = [-90, 0, 90]
+        positions = [azimuth_minus_90, azimuth_zero, azimuth_plus_90]
+        function = interp1d(degrees, positions)
+    if axis == 'el':
+        degrees = [0, -90]
+        positions = [elevation_zero, elevation_minus_90]
+    # position = numpy.interp(position, degrees, positions)
+    function = interp1d(degrees, positions, fill_value='extrapolate')
+    position = function(position)
+    position = int(position * 4.0)
+    return position
+
+
+class Robot:
+    def __init__(self):
+        from AriaPy import ArArgumentParser
+        from AriaPy import ArRobot
+        from AriaPy import ArRobotConnector
+        from AriaPy import Aria
+
+        set_sys_arg()
+        Aria.init()
+
+        Aria._parser = ArArgumentParser(sys.argv)
+        Aria._parser.loadDefaultArguments()
+        Aria._robot = ArRobot()
+
+        Aria._con = ArRobotConnector(Aria._parser, Aria._robot)
+        Aria._con.connectRobot()
+
+        self.robot = Aria._robot
+        self.robot.disableSonar()
+        self.robot.enableMotors()
+        self.robot.runAsync()
+
+    def disconnect(self):
+        self.robot.stopRunning()
+
+    def stop(self):
+        self.robot.stop()
+
+    def set_vel(self, velocity):
+        self.robot.lock()
+        self.robot.setVel(velocity)
+        self.robot.unlock()
+
+    def set_rot_vel(self, velocity):
+        self.robot.lock()
+        self.robot.setRotVel(-velocity)
+        self.robot.unlock()
+
+    def move(self, distance):
+        self.robot.lock()
+        self.robot.move(distance)
+        self.robot.unlock()
+
+    def rotate(self, angle):
+        self.robot.lock()
+        self.robot.setDeltaHeading(-angle)
+        self.robot.unlock()
+
+    def is_moving(self):
+        self.robot.lock()
+        status = ~self.robot.isStopped()
+        self.robot.unlock()
+        if status == -1: return 1
+        return 0
+
+
+class BatServer:
+    def __init__(self, minimal=False):
+        # Read settings file
+        self.settings = ConfigParser.ConfigParser()
+        self.settings.read('Desktop/amigobot/config/configuration.cfg')
+        # create logger with
+        self.logger = logging.getLogger('server')
+        self.logger.setLevel(logging.INFO)
+        # create file handler which logs even debug messages
+        file_logger = logging.FileHandler('server.log', mode='w')
+        file_logger.setLevel(logging.INFO)
+        # create console handler with a higher log level
+        console_logger = logging.StreamHandler(sys.stdout)
+        console_logger.setLevel(logging.INFO)
+        # create formatter and add it to the handlers
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_logger.setFormatter(formatter)
+        console_logger.setFormatter(formatter)
+        # add the handlers to the logger
+        self.logger.addHandler(file_logger)
+        self.logger.addHandler(console_logger)
+
+        # some defaults
+        self.break_character = '*'
+        self.image_path = 'capture.jpeg'
+
+        host = socket.gethostname()
+        self.buffer = 1024
+        self.host = host
+        self.log = []
+        self.sockets = []
+        self.print_log('Starting server at ' + host)
+        self.print_log('Server working directory: ' + os.getcwd())
+
+        # Connect to sonar system
+        self.sonar = Sonar.Sonar()
+        result = self.sonar.connect()
+        if not result: self.print_log('Sonar could not be initiated', level='w')
+        # Bind to sonar
+        self.open_connection(10030, bind_function=self.sonar_control)
+
+        if minimal: return
+
+        # Bind functions
+        self.open_connection(12345, self.shutdown)
+        self.open_connection(10001, bind_function=self.set_vel)
+        self.open_connection(10002, bind_function=self.set_rot_vel)
+        self.open_connection(10003, bind_function=self.move)
+        self.open_connection(10004, bind_function=self.rotate)
+        self.open_connection(10005, bind_function=self.stop)
+        self.open_connection(10006, bind_function=self.is_moving)
+        self.open_connection(10010, bind_function=self.set_pan_tilt)
+        self.open_connection(10020, bind_function=self.take_snapshot)
+
+        # Connect to servo
+        try:
+            self.servo = Maestro.Controller(ttyStr='/dev/ttyACM0')
+            # self.servo.setAccel(0, 8)
+            # self.servo.setAccel(1, 8)
+            self.servo.setSpeed(0, 0)
+            self.servo.setSpeed(1, 0)
+            self.print_log('Connected to servo controller')
+        except serial.serialutil.SerialException:
+            self.print_log('Could not connect to servo controller', level='w')
+
+        # Connect to robot
+        self.print_log('Starting robot connection')
+        self.robot = Robot()
+
+    ########################################
+    # ROBOT FUNCTIONS
+    ########################################
+
+    def set_vel(self, args):
+        if not type(args) == list: args = [args]
+        self.print_log(['Set Speed', args[0]])
+        velocity = float(args[0])
+        self.robot.set_vel(velocity)
+        return 'Speed Set'
+
+    def set_rot_vel(self, args):
+        if not type(args) == list: args = [args]
+        self.print_log(['Set Rotational Velocity', args[0]])
+        velocity = float(args[0])
+        self.robot.set_rot_vel(velocity)
+        return 'Rotational Velocity Set'
+
+    def move(self, args):
+        if not type(args) == list: args = [args]
+        distance = float(args[0])
+        formatted = '%.2f' % distance
+        self.print_log(['Set Forward Motion', formatted])
+        self.robot.move(distance)
+        return 'Forward Motion Set'
+
+    def rotate(self, args):
+        if not type(args) == list: args = [args]
+        angle = float(args[0])
+        formatted = '%.2f' % angle
+        self.print_log(['Set Rotation Motion', formatted])
+        self.robot.rotate(angle)
+        return 'Rotation Motion Set'
+
+    def is_moving(self, args=[]):
+        self.print_log('Get Motion Status')
+        return self.robot.is_moving()
+
+    def stop(self, args=[]):
+        self.print_log(['Stop Robot'])
+        self.robot.stop()
+        return 'Robot Stopped'
+
+    def set_pan_tilt(self, args):
+        pan = scale_motor_position(args[0], axis='az', settings=self.settings)
+        tilt = scale_motor_position(args[1], axis='el', settings=self.settings)
+        block = False
+        if args[2] == 'True': block = True
+        self.servo.setTarget(0, int(pan))
+        self.servo.setTarget(1, int(tilt))
+        if block:
+            while True:
+                pan_moving = self.servo.isMoving(0)
+                tilt_moving = self.servo.isMoving(1)
+                if not pan_moving and not tilt_moving: break
+                time.sleep(0.025)
+        return 'Pan tilt set: ' + str(pan) + ', ' + str(tilt) + ' [' + args[0] + ', ' + args[1] + ']'
+
+    def take_snapshot(self, args=[]):
+        p = Popen(['fswebcam', '--save', self.image_path, '--resolution', '300', '--quiet'])
+        time2 = time.time()
+        p.wait()
+        file = open(self.image_path, 'r')
+        data = file.read()
+        data = data + self.break_character
+        return data
+
+    def sonar_control(self, args=[]):
+        if not type(args) == list: args = [args]
+        result = self.sonar.text_command(args)
+        return result
+
+    ########################################
+    # SERVER FUNCTIONS
+    ########################################
+
+    def print_log(self, text, level='i'):
+        text = lst2str(text)
+        if level == 'i': self.logger.info(text)
+        if level == 'w': self.logger.warning(text)
+        if level == 'c': self.logger.critical(text)
+
+    def open_socket(self, port_number):
+        self.sockets.append(port_number)
+        skt = socket.socket()
+        skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Use '' as a host coupled_data to receive incoming connections from any host
+        skt.bind(('', port_number))
+        skt.listen(1)
+        return skt
+
+    def receive_data(self, connection):
+        data = ''
+        while 1:
+            packet = connection.recv(self.buffer)
+            if not packet: break
+            data += packet
+            if data.endswith(self.break_character): break
+        data = data.rstrip(self.break_character + '\n')
+        return data
+
+    def open_connection(self, port_number, bind_function=default_function):
+        t = threading.Thread(target=self.open_single_connection, args=(port_number, bind_function))
+        t.start()
+
+    def close_connection(self, port_number):
+        self.print_log(['Closing', port_number])
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_address = ('', port_number)
+        sock.connect(server_address)
+        sock.sendall('close' + self.break_character)
+        sock.close()
+
+    def shutdown(self):
+        ports = self.sockets
+
+        # Shut down robot
+        self.print_log(['Disconnect from robot'])
+        self.robot.set_vel(0)
+        self.robot.set_rot_vel(0)
+        self.robot.disconnect()
+
+        self.print_log(['Disconnect from sonar'])
+        self.sonar.disconnect()
+
+        self.print_log(['Shutting down Ports'] + ports)
+        if 12345 in ports: ports.remove(12345)
+        for port_number in ports: self.close_connection(port_number)
+        self.close_connection(12345)
+
+        self.print_log(['Finished shutting down'])
+        self.sockets = []
+
+    def open_single_connection(self, port_number, bind_function=default_function):
+        function_name = bind_function.__name__
+        self.print_log(['Opening connection for', function_name, 'on port', port_number])
+        skt = self.open_socket(port_number)
+        while 1:
+            self.print_log(['Listening for', function_name, 'on port', port_number])
+            connection, address = skt.accept()
+            start = time.time()
+            arguments = self.receive_data(connection)
+            arguments = arguments.split(',')
+            if function_name == 'shutdown':
+                self.shutdown()
+                break
+            if 'close' in arguments[0]: break
+            results = bind_function(arguments)
+            results = str(results)
+            if not results.endswith(self.break_character): results += self.break_character
+            connection.sendall(str(results))
+            connection.close()
+            stop = time.time()
+            delta = round((stop - start) * 1000)
+            self.print_log(['Response time for', function_name, ':', delta, 'ms'])
+        self.print_log(['Closing connection for', function_name, 'on port', port_number])
+        if 'close' in arguments[0]: connection.sendall('closed ' + str(port_number) + self.break_character)
+        connection.close()
+        skt.close()

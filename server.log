@@ -1,0 +1,6 @@
+2019-11-18 15:10:00,728 - server - INFO - Starting server at xps
+2019-11-18 15:10:00,728 - server - INFO - Server working directory: /home/dieter/Dropbox/PythonRepos/prateek
+2019-11-18 15:10:00,729 - server - INFO - Opening connection for shutdown on port 12345
+2019-11-18 15:10:00,729 - server - INFO - Listening for shutdown on port 12345
+2019-11-18 15:10:00,729 - server - INFO - Opening connection for test_communiction on port 10000
+2019-11-18 15:10:00,730 - server - INFO - Listening for test_communiction on port 10000
