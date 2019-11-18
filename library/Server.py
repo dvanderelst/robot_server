@@ -51,6 +51,7 @@ class Server:
 
     def test_communiction(self, args):
         if not type(args) == list: args = [args]
+        print('Test Communication Function Arguments', args)
         return 'success'
 
     ########################################
@@ -130,6 +131,8 @@ class Server:
             delta = round((stop - start) * 1000)
             self.print_log(['Response time for', function_name, ':', delta, 'ms'])
         self.print_log(['Closing connection for', function_name, 'on port', port_number])
-        if 'close' in arguments[0]: connection.sendall('closed ' + str(port_number) + self.break_character)
+        message = 'closed ' + str(port_number) + self.break_character
+        message = message.encode()
+        if 'close' in arguments[0]: connection.sendall(message)
         connection.close()
         skt.close()

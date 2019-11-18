@@ -88,8 +88,9 @@ class Client:
     ##################################
     # ROBOT CONTROL FUNCTIONS
     ##################################
-    def test_communication(self):
-        command = Misc.lst2command(['Test communication', 1, 2, 3])
+    def test_communication(self, message=[]):
+        arguments = ['Test communication', 1, 2, 3] + message
+        command = Misc.lst2command(arguments)
         reply = self.send_command(command, 10000)
         self.print_log([reply])
 
@@ -173,7 +174,7 @@ class Client:
                 # only break if there is no more data to be read from the remote session
                 if self.__stop_loop: break
         self.__stop_loop = False
-        self.stop_remote_python()
+        if not self.run_locally: self.stop_remote_python()
         self.ssh.close()
 
     ##################################
